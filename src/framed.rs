@@ -9,7 +9,10 @@ use std::{
 use bytes::{Buf, BufMut, BytesMut};
 use monoio::{
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut, IoVecWrapperMut, SliceMut},
-    io::{sink::Sink, stream::Stream, AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt},
+    io::{
+        sink::Sink, stream::Stream, CancelHandle, CancelableAsyncReadRent,
+        CancelableAsyncWriteRent, CancelableAsyncWriteRentExt,
+    },
     BufResult,
 };
 
@@ -23,6 +26,7 @@ pub struct FramedInner<IO, Codec, S> {
     io: IO,
     codec: Codec,
     state: S,
+    cancel_handle: CancelHandle,
 }
 
 #[derive(Debug)]
@@ -103,13 +107,22 @@ impl BorrowMut<WriteState> for RWState {
 
 impl<IO, Codec, S> FramedInner<IO, Codec, S> {
     #[inline]
-    const fn new(io: IO, codec: Codec, state: S) -> Self {
-        Self { io, codec, state }
+    const fn new(io: IO, codec: Codec, state: S, cancel_handle: CancelHandle) -> Self {
+        Self {
+            io,
+            codec,
+            state,
+            cancel_handle,
+        }
     }
 
-    async fn peek_data<'a, 'b>(io: &'b mut IO, state: &'a mut S) -> std::io::Result<&'a mut [u8]>
+    async fn peek_data<'a, 'b>(
+        io: &'b mut IO,
+        state: &'a mut S,
+        c: CancelHandle,
+    ) -> std::io::Result<&'a mut [u8]>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
         S: BorrowMut<ReadState>,
     {
         let read_state: &mut ReadState = state.borrow_mut();
@@ -137,7 +150,7 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
         let end = buffer.capacity();
         let owned_buf = std::mem::take(buffer);
         let owned_slice = unsafe { SliceMut::new_unchecked(owned_buf, 0, end) };
-        let (result, owned_slice) = io.read(owned_slice).await;
+        let (result, owned_slice) = io.cancelable_read(owned_slice, c).await;
         *buffer = owned_slice.into_inner();
         let n = ok!(result, state);
         if n == 0 {
@@ -155,9 +168,10 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
         io: &mut IO,
         codec: &mut Codec,
         state: &mut S,
+        c: CancelHandle,
     ) -> Option<Result<Codec::Item, Codec::Error>>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
         Codec: Decoder,
         S: BorrowMut<ReadState>,
     {
@@ -212,7 +226,7 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
                     };
                     let owned_buf = std::mem::take(buffer);
                     let owned_slice = unsafe { SliceMut::new_unchecked(owned_buf, begin, end) };
-                    let (result, owned_slice) = io.read(owned_slice).await;
+                    let (result, owned_slice) = io.cancelable_read(owned_slice, c.clone()).await;
                     *buffer = owned_slice.into_inner();
                     let n = ok!(result, state);
                     if n == 0 {
@@ -244,7 +258,7 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
                     };
                     let owned_buf = std::mem::take(buffer);
                     let owned_slice = unsafe { SliceMut::new_unchecked(owned_buf, begin, end) };
-                    let (result, owned_slice) = io.read(owned_slice).await;
+                    let (result, owned_slice) = io.cancelable_read(owned_slice, c.clone()).await;
                     *buffer = owned_slice.into_inner();
                     let n = ok!(result, state);
                     if n == 0 {
@@ -263,9 +277,9 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
         }
     }
 
-    async fn flush(io: &mut IO, state: &mut S) -> std::io::Result<()>
+    async fn flush(io: &mut IO, state: &mut S, c: CancelHandle) -> std::io::Result<()>
     where
-        IO: AsyncWriteRent,
+        IO: CancelableAsyncWriteRent,
         S: BorrowMut<WriteState>,
     {
         let WriteState { buffer } = state.borrow_mut();
@@ -274,7 +288,7 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
         }
         // This action does not allocate.
         let buf = std::mem::take(buffer);
-        let (result, buf) = io.write_all(buf).await;
+        let (result, buf) = io.write_all(buf, c).await;
         *buffer = buf;
         result?;
         buffer.clear();
@@ -288,23 +302,24 @@ impl<IO, Codec, S> FramedInner<IO, Codec, S> {
         codec: &mut Codec,
         state: &mut S,
         item: Item,
+        c: CancelHandle,
     ) -> Result<(), Codec::Error>
     where
-        IO: AsyncWriteRent,
+        IO: CancelableAsyncWriteRent,
         Codec: Encoder<Item>,
         S: BorrowMut<WriteState>,
     {
         if state.borrow_mut().buffer.len() >= BACKPRESSURE_BOUNDARY {
-            Self::flush(io, state).await?;
+            Self::flush(io, state, c).await?;
         }
         codec.encode(item, &mut state.borrow_mut().buffer)?;
         Ok(())
     }
 }
 
-impl<IO, Codec, S> AsyncReadRent for FramedInner<IO, Codec, S>
+impl<IO, Codec, S> monoio::io::AsyncReadRent for FramedInner<IO, Codec, S>
 where
-    IO: AsyncReadRent,
+    IO: CancelableAsyncReadRent,
     S: BorrowMut<ReadState>,
 {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
@@ -330,7 +345,10 @@ where
 
         // Read to buf directly if buf size is bigger than some threshold.
         if buf.bytes_total() > INITIAL_CAPACITY {
-            let (res, buf) = self.io.read(buf).await;
+            let (res, buf) = self
+                .io
+                .cancelable_read(buf, self.cancel_handle.clone())
+                .await;
             return match res {
                 Ok(0) => {
                     *state = State::Pausing;
@@ -346,7 +364,10 @@ where
         // Read to inner buffer and copy to buf.
         buffer.reserve(INITIAL_CAPACITY);
         let owned_buffer = std::mem::take(buffer);
-        let (res, owned_buffer) = self.io.read(owned_buffer).await;
+        let (res, owned_buffer) = self
+            .io
+            .cancelable_read(owned_buffer, self.cancel_handle.clone())
+            .await;
         *buffer = owned_buffer;
         match res {
             Ok(0) => {
@@ -386,7 +407,7 @@ where
 
 impl<IO, Codec, S> Stream for FramedInner<IO, Codec, S>
 where
-    IO: AsyncReadRent,
+    IO: CancelableAsyncReadRent,
     Codec: Decoder,
     S: BorrowMut<ReadState>,
 {
@@ -394,24 +415,30 @@ where
 
     #[inline]
     async fn next(&mut self) -> Option<Self::Item> {
-        Self::next_with(&mut self.io, &mut self.codec, &mut self.state).await
+        Self::next_with(
+            &mut self.io,
+            &mut self.codec,
+            &mut self.state,
+            self.cancel_handle.clone(),
+        )
+        .await
     }
 }
 
-impl<IO, Codec, S> AsyncWriteRent for FramedInner<IO, Codec, S>
+impl<IO, Codec, S> monoio::io::AsyncWriteRent for FramedInner<IO, Codec, S>
 where
-    IO: AsyncWriteRent,
+    IO: CancelableAsyncWriteRent,
     S: BorrowMut<WriteState>,
 {
     async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         let WriteState { buffer } = self.state.borrow_mut();
         if buffer.len() >= BACKPRESSURE_BOUNDARY || buf.bytes_init() >= INITIAL_CAPACITY {
             // flush buffer
-            if let Err(e) = AsyncWriteRent::flush(self).await {
+            if let Err(e) = monoio::io::AsyncWriteRent::flush(self).await {
                 return (Err(e), buf);
             }
             // write directly
-            return self.io.write_all(buf).await;
+            return self.io.write_all(buf, self.cancel_handle.clone()).await;
         }
         // copy to buffer
         let cap = buffer.capacity() - buffer.len();
@@ -434,20 +461,23 @@ where
 
     #[inline]
     async fn flush(&mut self) -> std::io::Result<()> {
-        FramedInner::<_, Codec, _>::flush(&mut self.io, &mut self.state).await
+        FramedInner::<_, Codec, _>::flush(&mut self.io, &mut self.state, self.cancel_handle.clone())
+            .await
     }
 
     #[inline]
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        AsyncWriteRent::flush(self).await?;
-        self.io.shutdown().await?;
+        monoio::io::AsyncWriteRent::flush(self).await?;
+        self.io
+            .cancelable_shutdown(self.cancel_handle.clone())
+            .await?;
         Ok(())
     }
 }
 
 impl<IO, Codec, S, Item> Sink<Item> for FramedInner<IO, Codec, S>
 where
-    IO: AsyncWriteRent,
+    IO: CancelableAsyncWriteRent,
     Codec: Encoder<Item>,
     S: BorrowMut<WriteState>,
 {
@@ -456,7 +486,12 @@ where
     #[inline]
     async fn send(&mut self, item: Item) -> Result<(), Self::Error> {
         if self.state.borrow_mut().buffer.len() >= BACKPRESSURE_BOUNDARY {
-            FramedInner::<_, Codec, _>::flush(&mut self.io, &mut self.state).await?;
+            FramedInner::<_, Codec, _>::flush(
+                &mut self.io,
+                &mut self.state,
+                self.cancel_handle.clone(),
+            )
+            .await?;
         }
         self.codec
             .encode(item, &mut self.state.borrow_mut().buffer)?;
@@ -465,13 +500,13 @@ where
 
     #[inline]
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        AsyncWriteRent::flush(self).await?;
+        monoio::io::AsyncWriteRent::flush(self).await?;
         Ok(())
     }
 
     #[inline]
     async fn close(&mut self) -> Result<(), Self::Error> {
-        AsyncWriteRent::shutdown(self).await?;
+        monoio::io::AsyncWriteRent::shutdown(self).await?;
         Ok(())
     }
 }
@@ -490,14 +525,19 @@ pub struct FramedWrite<IO, Codec> {
 
 impl<IO, Codec> Framed<IO, Codec> {
     #[inline]
-    pub fn new(io: IO, codec: Codec) -> Self {
+    pub fn new(io: IO, codec: Codec, cancel_handle: CancelHandle) -> Self {
         Self {
-            inner: FramedInner::new(io, codec, RWState::default()),
+            inner: FramedInner::new(io, codec, RWState::default(), cancel_handle),
         }
     }
 
     #[inline]
-    pub fn with_capacity(io: IO, codec: Codec, capacity: usize) -> Self {
+    pub fn with_capacity(
+        io: IO,
+        codec: Codec,
+        cancel_handle: CancelHandle,
+        capacity: usize,
+    ) -> Self {
         Self {
             inner: FramedInner::new(
                 io,
@@ -506,6 +546,7 @@ impl<IO, Codec> Framed<IO, Codec> {
                     read: ReadState::with_capacity(capacity),
                     write: Default::default(),
                 },
+                cancel_handle,
             ),
         }
     }
@@ -562,12 +603,18 @@ impl<IO, Codec> Framed<IO, Codec> {
     where
         F: FnOnce(Codec) -> CodecNew,
     {
-        let FramedInner { io, codec, state } = self.inner;
+        let FramedInner {
+            io,
+            codec,
+            state,
+            cancel_handle,
+        } = self.inner;
         Framed {
             inner: FramedInner {
                 io,
                 codec: map(codec),
                 state,
+                cancel_handle,
             },
         }
     }
@@ -619,18 +666,30 @@ impl<IO, Codec> Framed<IO, Codec> {
         codec: &mut C,
     ) -> Option<Result<C::Item, C::Error>>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
     {
-        FramedInner::next_with(&mut self.inner.io, codec, &mut self.inner.state).await
+        FramedInner::next_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 
     /// Await some new data.
     /// Useful to do read timeout.
-    pub fn peek_data(&mut self) -> impl Future<Output = std::io::Result<&mut [u8]>>
+    #[inline]
+    pub async fn peek_data(&mut self) -> std::io::Result<&mut [u8]>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
     {
-        FramedInner::<_, Codec, _>::peek_data(&mut self.inner.io, &mut self.inner.state)
+        FramedInner::<_, Codec, _>::peek_data(
+            &mut self.inner.io,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 
     /// Equivalent to Sink::send but with custom codec.
@@ -641,10 +700,17 @@ impl<IO, Codec> Framed<IO, Codec> {
         item: Item,
     ) -> Result<(), C::Error>
     where
-        IO: AsyncWriteRent,
+        IO: CancelableAsyncWriteRent,
         C: Encoder<Item>,
     {
-        FramedInner::send_with(&mut self.inner.io, codec, &mut self.inner.state, item).await
+        FramedInner::send_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            item,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 }
 
@@ -662,15 +728,20 @@ where
 }
 
 impl<IO, Codec> FramedRead<IO, Codec> {
-    pub fn new(io: IO, decoder: Codec) -> Self {
+    pub fn new(io: IO, decoder: Codec, cancel_handle: CancelHandle) -> Self {
         Self {
-            inner: FramedInner::new(io, decoder, ReadState::default()),
+            inner: FramedInner::new(io, decoder, ReadState::default(), cancel_handle),
         }
     }
 
-    pub fn with_capacity(io: IO, codec: Codec, capacity: usize) -> Self {
+    pub fn with_capacity(
+        io: IO,
+        codec: Codec,
+        cancel_handle: CancelHandle,
+        capacity: usize,
+    ) -> Self {
         Self {
-            inner: FramedInner::new(io, codec, ReadState::with_capacity(capacity)),
+            inner: FramedInner::new(io, codec, ReadState::with_capacity(capacity), cancel_handle),
         }
     }
 
@@ -719,12 +790,18 @@ impl<IO, Codec> FramedRead<IO, Codec> {
     where
         F: FnOnce(Codec) -> CodecNew,
     {
-        let FramedInner { io, codec, state } = self.inner;
+        let FramedInner {
+            io,
+            codec,
+            state,
+            cancel_handle,
+        } = self.inner;
         FramedRead {
             inner: FramedInner {
                 io,
                 codec: map(codec),
                 state,
+                cancel_handle,
             },
         }
     }
@@ -750,18 +827,29 @@ impl<IO, Codec> FramedRead<IO, Codec> {
         codec: &mut C,
     ) -> Option<Result<C::Item, C::Error>>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
     {
-        FramedInner::next_with(&mut self.inner.io, codec, &mut self.inner.state).await
+        FramedInner::next_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 
     /// Await some new data.
     /// Useful to do read timeout.
-    pub fn peek_data(&mut self) -> impl Future<Output = std::io::Result<&mut [u8]>>
+    pub async fn peek_data(&mut self) -> std::io::Result<&mut [u8]>
     where
-        IO: AsyncReadRent,
+        IO: CancelableAsyncReadRent,
     {
-        FramedInner::<_, Codec, _>::peek_data(&mut self.inner.io, &mut self.inner.state)
+        FramedInner::<_, Codec, _>::peek_data(
+            &mut self.inner.io,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 }
 
@@ -781,9 +869,9 @@ where
 }
 
 impl<IO, Codec> FramedWrite<IO, Codec> {
-    pub fn new(io: IO, encoder: Codec) -> Self {
+    pub fn new(io: IO, encoder: Codec, cancel_handle: CancelHandle) -> Self {
         Self {
-            inner: FramedInner::new(io, encoder, WriteState::default()),
+            inner: FramedInner::new(io, encoder, WriteState::default(), cancel_handle),
         }
     }
 
@@ -832,12 +920,18 @@ impl<IO, Codec> FramedWrite<IO, Codec> {
     where
         F: FnOnce(Codec) -> CodecNew,
     {
-        let FramedInner { io, codec, state } = self.inner;
+        let FramedInner {
+            io,
+            codec,
+            state,
+            cancel_handle,
+        } = self.inner;
         FramedWrite {
             inner: FramedInner {
                 io,
                 codec: map(codec),
                 state,
+                cancel_handle,
             },
         }
     }
@@ -869,7 +963,7 @@ where
 
 impl<IO, Codec> Stream for Framed<IO, Codec>
 where
-    IO: AsyncReadRent,
+    IO: CancelableAsyncReadRent,
     Codec: Decoder,
 {
     type Item = <FramedInner<IO, Codec, RWState> as Stream>::Item;
@@ -882,7 +976,7 @@ where
 
 impl<IO, Codec> Stream for FramedRead<IO, Codec>
 where
-    IO: AsyncReadRent,
+    IO: CancelableAsyncReadRent,
     Codec: Decoder,
 {
     type Item = <FramedInner<IO, Codec, ReadState> as Stream>::Item;
@@ -895,7 +989,7 @@ where
 
 impl<IO, Codec, Item> Sink<Item> for Framed<IO, Codec>
 where
-    IO: AsyncWriteRent,
+    IO: CancelableAsyncWriteRent,
     Codec: Encoder<Item>,
 {
     type Error = <FramedInner<IO, Codec, RWState> as Sink<Item>>::Error;
@@ -918,7 +1012,7 @@ where
 
 impl<IO, Codec, Item> Sink<Item> for FramedWrite<IO, Codec>
 where
-    IO: AsyncWriteRent,
+    IO: CancelableAsyncWriteRent,
     Codec: Encoder<Item>,
 {
     type Error = <FramedInner<IO, Codec, WriteState> as Sink<Item>>::Error;
@@ -958,27 +1052,41 @@ where
     fn flush(&mut self) -> impl Future<Output = Result<(), T::Error>>;
 }
 
-impl<Codec: Decoder, IO: AsyncReadRent, AnyCodec> StreamWithCodec<Codec>
+impl<Codec: Decoder, IO: CancelableAsyncReadRent, AnyCodec> StreamWithCodec<Codec>
     for FramedRead<IO, AnyCodec>
 {
     type Item = Result<Codec::Item, Codec::Error>;
 
     #[inline]
     async fn next_with<'a>(&'a mut self, codec: &'a mut Codec) -> Option<Self::Item> {
-        FramedInner::next_with(&mut self.inner.io, codec, &mut self.inner.state).await
+        FramedInner::next_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 }
 
-impl<Codec: Decoder, IO: AsyncReadRent, AnyCodec> StreamWithCodec<Codec> for Framed<IO, AnyCodec> {
+impl<Codec: Decoder, IO: CancelableAsyncReadRent, AnyCodec> StreamWithCodec<Codec>
+    for Framed<IO, AnyCodec>
+{
     type Item = Result<Codec::Item, Codec::Error>;
 
     #[inline]
     async fn next_with<'a>(&'a mut self, codec: &'a mut Codec) -> Option<Self::Item> {
-        FramedInner::next_with(&mut self.inner.io, codec, &mut self.inner.state).await
+        FramedInner::next_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 }
 
-impl<Codec: Encoder<Item>, IO: AsyncWriteRent, AnyCodec, Item> SinkWithCodec<Codec, Item>
+impl<Codec: Encoder<Item>, IO: CancelableAsyncWriteRent, AnyCodec, Item> SinkWithCodec<Codec, Item>
     for FramedWrite<IO, AnyCodec>
 {
     #[inline]
@@ -987,18 +1095,29 @@ impl<Codec: Encoder<Item>, IO: AsyncWriteRent, AnyCodec, Item> SinkWithCodec<Cod
         codec: &'a mut Codec,
         item: Item,
     ) -> Result<(), Codec::Error> {
-        FramedInner::send_with(&mut self.inner.io, codec, &mut self.inner.state, item).await
+        FramedInner::send_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            item,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 
     #[inline]
     async fn flush(&mut self) -> Result<(), Codec::Error> {
-        FramedInner::<_, (), _>::flush(&mut self.inner.io, &mut self.inner.state)
-            .await
-            .map_err(|e| e.into())
+        FramedInner::<_, (), _>::flush(
+            &mut self.inner.io,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
+        .map_err(|e| e.into())
     }
 }
 
-impl<Codec: Encoder<Item>, IO: AsyncWriteRent, AnyCodec, Item> SinkWithCodec<Codec, Item>
+impl<Codec: Encoder<Item>, IO: CancelableAsyncWriteRent, AnyCodec, Item> SinkWithCodec<Codec, Item>
     for Framed<IO, AnyCodec>
 {
     #[inline]
@@ -1007,18 +1126,29 @@ impl<Codec: Encoder<Item>, IO: AsyncWriteRent, AnyCodec, Item> SinkWithCodec<Cod
         codec: &'a mut Codec,
         item: Item,
     ) -> Result<(), Codec::Error> {
-        FramedInner::send_with(&mut self.inner.io, codec, &mut self.inner.state, item).await
+        FramedInner::send_with(
+            &mut self.inner.io,
+            codec,
+            &mut self.inner.state,
+            item,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
     }
 
     #[inline]
     async fn flush(&mut self) -> Result<(), Codec::Error> {
-        FramedInner::<_, (), _>::flush(&mut self.inner.io, &mut self.inner.state)
-            .await
-            .map_err(|e| e.into())
+        FramedInner::<_, (), _>::flush(
+            &mut self.inner.io,
+            &mut self.inner.state,
+            self.inner.cancel_handle.clone(),
+        )
+        .await
+        .map_err(|e| e.into())
     }
 }
 
-impl<IO: AsyncReadRent, Codec> AsyncReadRent for Framed<IO, Codec> {
+impl<IO: CancelableAsyncReadRent, Codec> monoio::io::AsyncReadRent for Framed<IO, Codec> {
     #[inline]
     async fn read<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
         self.inner.read(buf).await
@@ -1030,7 +1160,7 @@ impl<IO: AsyncReadRent, Codec> AsyncReadRent for Framed<IO, Codec> {
     }
 }
 
-impl<IO: AsyncReadRent, Codec> AsyncReadRent for FramedRead<IO, Codec> {
+impl<IO: CancelableAsyncReadRent, Codec> monoio::io::AsyncReadRent for FramedRead<IO, Codec> {
     #[inline]
     async fn read<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
         self.inner.read(buf).await
@@ -1042,7 +1172,7 @@ impl<IO: AsyncReadRent, Codec> AsyncReadRent for FramedRead<IO, Codec> {
     }
 }
 
-impl<IO: AsyncWriteRent, Codec> AsyncWriteRent for Framed<IO, Codec> {
+impl<IO: CancelableAsyncWriteRent, Codec> monoio::io::AsyncWriteRent for Framed<IO, Codec> {
     #[inline]
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         self.inner.write(buf).await
@@ -1064,7 +1194,7 @@ impl<IO: AsyncWriteRent, Codec> AsyncWriteRent for Framed<IO, Codec> {
     }
 }
 
-impl<IO: AsyncWriteRent, Codec> AsyncWriteRent for FramedWrite<IO, Codec> {
+impl<IO: CancelableAsyncWriteRent, Codec> monoio::io::AsyncWriteRent for FramedWrite<IO, Codec> {
     #[inline]
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         self.inner.write(buf).await

@@ -1,7 +1,7 @@
 use std::io;
 
 use bytes::BytesMut;
-use monoio::io::{AsyncReadRent, AsyncWriteRent};
+use monoio::io::{CancelHandle, CancelableAsyncReadRent, CancelableAsyncWriteRent};
 pub use tokio_util::codec::Encoder;
 
 use crate::Framed;
@@ -132,10 +132,14 @@ pub trait Decoder {
     /// [`Stream`]: futures_core::Stream
     /// [`Sink`]: futures_sink::Sink
     /// [`Framed`]: crate::Framed
-    fn framed<T: AsyncReadRent + AsyncWriteRent + Sized>(self, io: T) -> Framed<T, Self>
+    fn framed<T: CancelableAsyncReadRent + CancelableAsyncWriteRent + Sized>(
+        self,
+        io: T,
+        cancel_handle: CancelHandle,
+    ) -> Framed<T, Self>
     where
         Self: Sized,
     {
-        Framed::new(io, self)
+        Framed::new(io, self, cancel_handle)
     }
 }

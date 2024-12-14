@@ -379,7 +379,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRent};
+use monoio::io::{CancelHandle, CancelableAsyncReadRent, CancelableAsyncWriteRent};
 
 use crate::{Decoded, Decoder, Encoder, Framed, FramedRead, FramedWrite};
 
@@ -959,11 +959,15 @@ impl Builder {
     /// # }
     /// # pub fn main() {}
     /// ```
-    pub fn new_read<T>(&self, upstream: T) -> FramedRead<T, LengthDelimitedCodec>
+    pub fn new_read<T>(
+        &self,
+        upstream: T,
+        cancel_handle: CancelHandle,
+    ) -> FramedRead<T, LengthDelimitedCodec>
     where
-        T: AsyncReadRent,
+        T: CancelableAsyncReadRent,
     {
-        FramedRead::new(upstream, self.new_codec())
+        FramedRead::new(upstream, self.new_codec(), cancel_handle)
     }
 
     /// Create a configured length delimited `FramedWrite`
@@ -980,11 +984,15 @@ impl Builder {
     /// # }
     /// # pub fn main() {}
     /// ```
-    pub fn new_write<T>(&self, inner: T) -> FramedWrite<T, LengthDelimitedCodec>
+    pub fn new_write<T>(
+        &self,
+        inner: T,
+        cancel_handle: CancelHandle,
+    ) -> FramedWrite<T, LengthDelimitedCodec>
     where
-        T: AsyncWriteRent,
+        T: CancelableAsyncWriteRent,
     {
-        FramedWrite::new(inner, self.new_codec())
+        FramedWrite::new(inner, self.new_codec(), cancel_handle)
     }
 
     /// Create a configured length delimited `Framed`
@@ -1002,11 +1010,15 @@ impl Builder {
     /// # }
     /// # pub fn main() {}
     /// ```
-    pub fn new_framed<T>(&self, inner: T) -> Framed<T, LengthDelimitedCodec>
+    pub fn new_framed<T>(
+        &self,
+        inner: T,
+        cancel_handle: CancelHandle,
+    ) -> Framed<T, LengthDelimitedCodec>
     where
-        T: AsyncReadRent + AsyncWriteRent,
+        T: CancelableAsyncReadRent + CancelableAsyncWriteRent,
     {
-        Framed::new(inner, self.new_codec())
+        Framed::new(inner, self.new_codec(), cancel_handle)
     }
 
     fn num_head_bytes(&self) -> usize {
